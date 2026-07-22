@@ -68,6 +68,7 @@ class StalwartClient:
             headers={
                 "Authorization": f"Bearer {self._token}",
                 "Content-Type": "application/json",
+                "User-Agent": "StalwartMCP/1.1.1",
             },
             timeout=30.0,
         )
