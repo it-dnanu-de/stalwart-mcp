@@ -66,7 +66,7 @@ jobs:
             gh release list --json tagName -q '.[].tagName' | while read -r tag; do
               V="${tag#v}"
               WHL="stalwart_mcp-${V}-py3-none-any.whl"
-              echo "<a href=\"https://github.com/nikitatsym/stalwart-mcp/releases/download/${tag}/${WHL}\">${WHL}</a>"
+              echo "<a href=\"https://github.com/it-dnanu-de/stalwart-mcp/releases/download/${tag}/${WHL}\">${WHL}</a>"
             done
             echo '</body></html>'
           } > _site/simple/stalwart-mcp/index.html

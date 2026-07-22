@@ -109,7 +109,7 @@ class StalwartClient:
         payload = {"using": using, "methodCalls": method_calls}
         return self._handle(
             self._http.post(
-                f"{self._base}/jmap/",
+                "/jmap/",
                 json=payload,
             )
         )
