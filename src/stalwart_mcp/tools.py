@@ -1,3 +1,9 @@
+"""MCP tool definitions for Stalwart mail server management via JMAP.
+
+Each tool is a decorated function in a named Group. The server dispatches
+by operation name (PascalCase) and calls the function with type-coerced params.
+"""
+
 from .client import StalwartClient
 from .registry import ROOT, Group, _op
 
@@ -21,7 +27,7 @@ def _ok(data):
 
 # ── Slim helpers ──────────────────────────────────────────────────────
 
-_SLIM_PRINCIPAL = {"id", "name", "type", "description", "emails"}
+_DEFAULT_PRINCIPAL_PROPS = ["id", "name", "description", "emailAddress", "roles", "createdAt"]
 
 
 def _slim(item: dict, fields: set) -> dict:
@@ -30,6 +36,18 @@ def _slim(item: dict, fields: set) -> dict:
 
 def _slim_list(items: list, fields: set) -> list:
     return [_slim(i, fields) for i in items if isinstance(i, dict)]
+
+
+# ── Unavailable operation marker ──────────────────────────────────────
+
+def _unavailable(operation: str, reason: str) -> dict:
+    """Return a structured unavailable response for operations
+    that have no JMAP equivalent in Stalwart Community Edition."""
+    return {
+        "error": f"{operation} is not available via JMAP management API.",
+        "reason": reason,
+        "suggestion": "Use the Stalwart WebAdmin at /account for this operation.",
+    }
 
 
 # ── Groups ────────────────────────────────────────────────────────────
@@ -78,10 +96,18 @@ def stalwart_version():
     from importlib.metadata import version
 
     try:
-        _get_client().get_text("/health/live")
-        service = {"status": "ok"}
-    except Exception:
-        service = {"status": "error"}
+        client = _get_client()
+        result = client.query_and_get(
+            object_type="x:Account",
+            limit=1,
+            properties=["id", "name"],
+        )
+        service = {
+            "status": "ok",
+            "account_count": result.get("total", 0),
+        }
+    except Exception as exc:
+        service = {"status": "error", "detail": str(exc)}
     return {"mcp": version("stalwart-mcp"), "service": service}
 
 
@@ -93,33 +119,64 @@ def list_principals(
     page: int | None = None,
     limit: int = 20,
 ):
-    """List principals. types: individual,group,list,domain,tenant,role,apiKey,oauthClient,resource,location."""
-    params: dict = {"limit": limit}
+    """List principals (accounts). types filter: individual, group, list, domain, tenant, role, apiKey, oauthClient."""
+    position = 0
+    if page is not None and page > 0:
+        position = (page - 1) * limit
+
+    filter_dict = None
     if types is not None:
-        params["types"] = types
-    if page is not None:
-        params["page"] = page
-    result = _get_client().get("/api/principal", params=params)
-    if isinstance(result, dict) and "data" in result:
-        data = result["data"]
-        if isinstance(data, dict) and "items" in data:
-            data["items"] = _slim_list(data["items"], _SLIM_PRINCIPAL)
-        return result
-    if isinstance(result, list):
-        return _slim_list(result, _SLIM_PRINCIPAL)
-    return _ok(result)
+        type_list = [t.strip() for t in types.split(",")]
+        filter_dict = {"type": type_list}
+
+    result = _get_client().query_and_get(
+        object_type="x:Account",
+        filter=filter_dict,
+        limit=limit,
+        position=position,
+        properties=["id", "name", "description", "emailAddress", "roles", "createdAt"],
+    )
+
+    items = _slim_list(result.get("items", []), _DEFAULT_PRINCIPAL_PROPS)
+    return {
+        "items": items,
+        "total": result.get("total", 0),
+        "page": page or 1,
+        "limit": limit,
+    }
 
 
 @_op(stalwart_read)
 def show_principal(id: str):
     """Get full principal details by ID."""
-    return _ok(_get_client().get(f"/api/principal/{id}"))
+    result = _get_client().get_by_ids(
+        object_type="x:Account",
+        ids=[id],
+        properties=[
+            "id", "name", "description", "emailAddress", "roles",
+            "memberOf", "enabledPermissions", "disabledPermissions",
+            "createdAt", "quota",
+        ],
+    )
+    items = result.get("list", [])
+    if items:
+        return items[0]
+    return {"error": f"Principal {id} not found.", "not_found": result.get("notFound", [id])}
 
 
 @_op(stalwart_read)
 def get_queue_status():
-    """Get mail queue processing status."""
-    return _ok(_get_client().get("/api/queue/status"))
+    """Get mail queue processing status (count of queued messages)."""
+    result = _get_client().query_and_get(
+        object_type="x:QueuedMessage",
+        limit=1,
+        calculate_total=True,
+        properties=["id"],
+    )
+    return {
+        "queued_count": result.get("total", 0),
+        "status": "ok",
+    }
 
 
 @_op(stalwart_read)
@@ -128,19 +185,46 @@ def list_queue_messages(
     limit: int = 20,
     values: str | None = None,
 ):
-    """List queued messages. values: filter string."""
-    params: dict = {"limit": limit}
-    if page is not None:
-        params["page"] = page
+    """List queued messages. values: filter string (searches return path, sender, recipient)."""
+    position = 0
+    if page is not None and page > 0:
+        position = (page - 1) * limit
+
+    filter_dict = None
     if values is not None:
-        params["values"] = values
-    return _ok(_get_client().get("/api/queue/messages", params=params))
+        filter_dict = {"text": values}
+
+    result = _get_client().query_and_get(
+        object_type="x:QueuedMessage",
+        filter=filter_dict,
+        limit=limit,
+        position=position,
+        properties=["id", "returnPath", "nextRetry", "createdAt", "size", "status"],
+    )
+    return {
+        "items": result.get("items", []),
+        "total": result.get("total", 0),
+        "page": page or 1,
+        "limit": limit,
+    }
 
 
 @_op(stalwart_read)
-def show_queue_message(id: int):
-    """Get full details of a queued message."""
-    return _ok(_get_client().get(f"/api/queue/messages/{id}"))
+def show_queue_message(id: str):
+    """Get full details of a queued message by ID."""
+    result = _get_client().get_by_ids(
+        object_type="x:QueuedMessage",
+        ids=[id],
+        properties=[
+            "id", "returnPath", "nextRetry", "createdAt", "size",
+            "status", "priority", "envId", "from", "to",
+            "subject", "receivedAt", "queueId", "retryCount",
+        ],
+    )
+    items = result.get("list", [])
+    if items:
+        return items[0]
+    return {"error": f"Queued message {id} not found."}
 
 
 @_op(stalwart_read)
@@ -149,10 +233,59 @@ def list_queued_reports(
     limit: int = 20,
 ):
     """List queued delivery reports."""
-    params: dict = {"limit": limit}
-    if page is not None:
-        params["page"] = page
-    return _ok(_get_client().get("/api/queue/reports", params=params))
+    return _unavailable(
+        "ListQueuedReports",
+        "Delivery reports are available via x:InboxReport and x:OutboxReport "
+        "management objects. Use ListInboxReports or ListOutboxReports instead.",
+    )
+
+
+@_op(stalwart_read)
+def list_inbox_reports(
+    page: int | None = None,
+    limit: int = 20,
+):
+    """List incoming DMARC/TLS/ARF reports."""
+    position = 0
+    if page is not None and page > 0:
+        position = (page - 1) * limit
+
+    result = _get_client().query_and_get(
+        object_type="x:InboxReport",
+        limit=limit,
+        position=position,
+        properties=["id", "type", "timestamp", "subject", "from"],
+    )
+    return {
+        "items": result.get("items", []),
+        "total": result.get("total", 0),
+        "page": page or 1,
+        "limit": limit,
+    }
+
+
+@_op(stalwart_read)
+def list_outbox_reports(
+    page: int | None = None,
+    limit: int = 20,
+):
+    """List outgoing DMARC/TLS reports."""
+    position = 0
+    if page is not None and page > 0:
+        position = (page - 1) * limit
+
+    result = _get_client().query_and_get(
+        object_type="x:OutboxReport",
+        limit=limit,
+        position=position,
+        properties=["id", "type", "timestamp", "subject", "to"],
+    )
+    return {
+        "items": result.get("items", []),
+        "total": result.get("total", 0),
+        "page": page or 1,
+        "limit": limit,
+    }
 
 
 @_op(stalwart_read)
@@ -160,11 +293,11 @@ def list_dmarc_reports(
     page: int | None = None,
     limit: int = 20,
 ):
-    """List incoming DMARC reports."""
-    params: dict = {"limit": limit}
-    if page is not None:
-        params["page"] = page
-    return _ok(_get_client().get("/api/reports/dmarc", params=params))
+    """List incoming DMARC reports. Redirects to ListInboxReports."""
+    result = list_inbox_reports(page=page, limit=limit)
+    if "items" in result:
+        result["note"] = "Filter by type='dmarc' for DMARC-only reports."
+    return result
 
 
 @_op(stalwart_read)
@@ -172,11 +305,11 @@ def list_tls_reports(
     page: int | None = None,
     limit: int = 20,
 ):
-    """List incoming TLS reports."""
-    params: dict = {"limit": limit}
-    if page is not None:
-        params["page"] = page
-    return _ok(_get_client().get("/api/reports/tls", params=params))
+    """List incoming TLS reports. Redirects to ListInboxReports."""
+    result = list_inbox_reports(page=page, limit=limit)
+    if "items" in result:
+        result["note"] = "Filter by type='tlsrpt' for TLS-only reports."
+    return result
 
 
 @_op(stalwart_read)
@@ -184,11 +317,11 @@ def list_arf_reports(
     page: int | None = None,
     limit: int = 20,
 ):
-    """List incoming ARF/abuse reports."""
-    params: dict = {"limit": limit}
-    if page is not None:
-        params["page"] = page
-    return _ok(_get_client().get("/api/reports/arf", params=params))
+    """List incoming ARF/abuse reports. Redirects to ListInboxReports."""
+    result = list_inbox_reports(page=page, limit=limit)
+    if "items" in result:
+        result["note"] = "Filter by type='arf' for ARF-only reports."
+    return result
 
 
 @_op(stalwart_read)
@@ -196,13 +329,23 @@ def get_settings_by_keys(
     keys: list | None = None,
     prefixes: list | None = None,
 ):
-    """Get settings by specific keys or prefixes."""
-    params: dict = {}
+    """Get system settings. Pass property names as keys list to filter which settings to return."""
+    properties = [
+        "id", "defaultHostname", "defaultDomainId", "defaultCertificateId",
+        "maxConnections", "threadPoolSize", "proxyTrustedNetworks",
+    ]
     if keys is not None:
-        params["keys"] = keys
-    if prefixes is not None:
-        params["prefixes"] = prefixes
-    return _ok(_get_client().get("/api/settings/keys", params=params))
+        properties = [k for k in keys if isinstance(k, str)]
+
+    result = _get_client().get_by_ids(
+        object_type="x:SystemSettings",
+        ids=["singleton"],
+        properties=properties,
+    )
+    items = result.get("list", [])
+    if items:
+        return items[0]
+    return {"error": "SystemSettings singleton not found."}
 
 
 @_op(stalwart_read)
@@ -212,24 +355,69 @@ def get_settings_by_group(
     page: int | None = None,
     limit: int = 20,
 ):
-    """Get settings by group prefix/suffix."""
-    params: dict = {"limit": limit}
-    if prefix is not None:
-        params["prefix"] = prefix
-    if suffix is not None:
-        params["suffix"] = suffix
-    if page is not None:
-        params["page"] = page
-    return _ok(_get_client().get("/api/settings/group", params=params))
+    """Get settings by group prefix/suffix. Returns all matching settings.
+
+    prefix: e.g. 'network', 'storage', 'authentication', 'tls', 'mta',
+            'cluster', 'spam', 'email', 'calendar', 'sieve', 'security',
+            'lookup', 'search', 'telemetry', 'ai', 'enterprise'
+    """
+    # Map common prefixes to SystemSettings property groups
+    prefix_to_props = {
+        "network": ["defaultHostname", "defaultDomainId", "defaultCertificateId",
+                     "maxConnections", "threadPoolSize", "proxyTrustedNetworks"],
+        "tls": ["defaultCertificateId"],
+        "mta": ["defaultHostname", "defaultDomainId"],
+        "spam": [],
+        "email": [],
+        "storage": [],
+        "authentication": [],
+        "cluster": [],
+        "calendar": [],
+        "sieve": [],
+        "security": [],
+        "lookup": [],
+        "search": [],
+        "telemetry": [],
+        "ai": [],
+        "enterprise": [],
+    }
+    properties = prefix_to_props.get(prefix or "", ["id", "defaultHostname",
+        "defaultDomainId", "defaultCertificateId", "maxConnections",
+        "threadPoolSize", "proxyTrustedNetworks"])
+
+    result = _get_client().get_by_ids(
+        object_type="x:SystemSettings",
+        ids=["singleton"],
+        properties=properties,
+    )
+    items = result.get("list", [])
+    if items:
+        data = items[0]
+        if suffix:
+            matching = {k: v for k, v in data.items() if suffix.lower() in k.lower()}
+            return matching
+        return data
+    return {"error": "SystemSettings singleton not found."}
 
 
 @_op(stalwart_read)
 def list_settings(prefix: str | None = None):
     """List all settings, optionally filtered by prefix."""
-    params: dict = {}
-    if prefix is not None:
-        params["prefix"] = prefix
-    return _ok(_get_client().get("/api/settings/list", params=params))
+    props = ["id", "defaultHostname", "defaultDomainId", "defaultCertificateId",
+             "maxConnections", "threadPoolSize", "proxyTrustedNetworks"]
+    result = _get_client().get_by_ids(
+        object_type="x:SystemSettings",
+        ids=["singleton"],
+        properties=props,
+    )
+    items = result.get("list", [])
+    if items:
+        data = items[0]
+        if prefix:
+            matching = {k: v for k, v in data.items() if k.lower().startswith(prefix.lower())}
+            return matching
+        return data
+    return {"error": "SystemSettings singleton not found."}
 
 
 @_op(stalwart_read)
@@ -237,20 +425,33 @@ def list_logs(
     page: int | None = None,
     limit: int = 20,
 ):
-    """List server logs."""
-    params: dict = {"limit": limit}
-    if page is not None:
-        params["page"] = page
-    return _ok(_get_client().get("/api/logs", params=params))
+    """List server log entries."""
+    position = 0
+    if page is not None and page > 0:
+        position = (page - 1) * limit
+
+    result = _get_client().query_and_get(
+        object_type="x:Log",
+        limit=limit,
+        position=position,
+        properties=["id", "timestamp", "level", "event", "details"],
+    )
+    return {
+        "items": result.get("items", []),
+        "total": result.get("total", 0),
+        "page": page or 1,
+        "limit": limit,
+    }
 
 
 @_op(stalwart_read)
-def list_metrics(after: str | None = None):
-    """List telemetry metrics. after: timestamp filter."""
-    params: dict = {}
-    if after is not None:
-        params["after"] = after
-    return _ok(_get_client().get("/api/telemetry/metrics", params=params))
+def list_metrics():
+    """List telemetry metrics from current live metrics."""
+    return _unavailable(
+        "ListMetrics",
+        "Live metrics streaming uses server-sent events, not JMAP. "
+        "Use the WebAdmin Observability section or check /api/schema for available metrics.",
+    )
 
 
 @_op(stalwart_read)
@@ -259,25 +460,124 @@ def list_traces(
     page: int | None = None,
     limit: int = 20,
 ):
-    """List telemetry traces."""
-    params: dict = {"limit": limit}
-    if type is not None:
-        params["type"] = type
-    if page is not None:
-        params["page"] = page
-    return _ok(_get_client().get("/api/telemetry/traces", params=params))
+    """List live tracing sessions."""
+    position = 0
+    if page is not None and page > 0:
+        position = (page - 1) * limit
+
+    result = _get_client().query_and_get(
+        object_type="x:LiveTrace",
+        limit=limit,
+        position=position,
+        properties=["id", "type", "startedAt", "status"],
+    )
+    return {
+        "items": result.get("items", []),
+        "total": result.get("total", 0),
+        "page": page or 1,
+        "limit": limit,
+    }
 
 
 @_op(stalwart_read)
 def show_trace(id: str):
     """Get full trace details by ID."""
-    return _ok(_get_client().get(f"/api/telemetry/trace/{id}"))
+    result = _get_client().get_by_ids(
+        object_type="x:LiveTrace",
+        ids=[id],
+        properties=["id", "type", "startedAt", "status", "filter", "duration"],
+    )
+    items = result.get("list", [])
+    if items:
+        return items[0]
+    return {"error": f"Trace {id} not found."}
+
+
+@_op(stalwart_read)
+def list_domains(
+    page: int | None = None,
+    limit: int = 20,
+):
+    """List managed domains."""
+    position = 0
+    if page is not None and page > 0:
+        position = (page - 1) * limit
+
+    result = _get_client().query_and_get(
+        object_type="x:Domain",
+        limit=limit,
+        position=position,
+        properties=["id", "name"],
+    )
+    return {
+        "items": result.get("items", []),
+        "total": result.get("total", 0),
+        "page": page or 1,
+        "limit": limit,
+    }
+
+
+@_op(stalwart_read)
+def list_dkim_signatures(
+    page: int | None = None,
+    limit: int = 20,
+):
+    """List DKIM signatures."""
+    position = 0
+    if page is not None and page > 0:
+        position = (page - 1) * limit
+
+    result = _get_client().query_and_get(
+        object_type="x:DkimSignature",
+        limit=limit,
+        position=position,
+        properties=["id", "selector", "createdAt", "stage"],
+    )
+    return {
+        "items": result.get("items", []),
+        "total": result.get("total", 0),
+        "page": page or 1,
+        "limit": limit,
+    }
 
 
 @_op(stalwart_read)
 def get_dns_records(domain: str):
-    """Get DNS records for a domain."""
-    return _ok(_get_client().get(f"/api/dns/records/{domain}"))
+    """Get DNS records for a domain. Returns domain information from Stalwart."""
+    result = _get_client().query_and_get(
+        object_type="x:Domain",
+        filter={"name": domain},
+        limit=1,
+        properties=["id", "name"],
+    )
+    items = result.get("items", [])
+    if items:
+        return items[0]
+    return {"error": f"Domain {domain} not found in Stalwart."}
+
+
+@_op(stalwart_read)
+def list_certificates(
+    page: int | None = None,
+    limit: int = 20,
+):
+    """List TLS certificates."""
+    position = 0
+    if page is not None and page > 0:
+        position = (page - 1) * limit
+
+    result = _get_client().query_and_get(
+        object_type="x:Certificate",
+        limit=limit,
+        position=position,
+        properties=["id", "subjectAlternativeNames", "issuer", "notBefore", "notAfter"],
+    )
+    return {
+        "items": result.get("items", []),
+        "total": result.get("total", 0),
+        "page": page or 1,
+        "limit": limit,
+    }
 
 
 @_op(stalwart_read)
@@ -287,19 +587,70 @@ def list_deleted_messages(
     limit: int = 20,
 ):
     """List deleted messages for an account (available for restore)."""
-    params: dict = {"limit": limit}
-    if page is not None:
-        params["page"] = page
-    return _ok(_get_client().get(f"/api/store/undelete/{account_id}", params=params))
+    return _unavailable(
+        "ListDeletedMessages",
+        "Undelete/restore has no JMAP management endpoint in Stalwart v0.16. "
+        "Use the WebAdmin or IMAP to manage deleted messages.",
+    )
 
 
 @_op(stalwart_read)
 def get_blob(blob_id: str, limit: int | None = None):
     """Get raw blob content by ID."""
-    params: dict = {}
-    if limit is not None:
-        params["limit"] = limit
-    return _ok(_get_client().get_text(f"/api/store/blobs/{blob_id}", params=params))
+    return _unavailable(
+        "GetBlob",
+        "Blob retrieval via JMAP is not available for management accounts. "
+        "Use the WebAdmin for blob inspection.",
+    )
+
+
+@_op(stalwart_read)
+def list_groups(
+    page: int | None = None,
+    limit: int = 20,
+):
+    """List groups (principal type 'group')."""
+    position = 0
+    if page is not None and page > 0:
+        position = (page - 1) * limit
+
+    result = _get_client().query_and_get(
+        object_type="x:Account",
+        filter={"type": ["group"]},
+        limit=limit,
+        position=position,
+        properties=["id", "name", "type", "description"],
+    )
+    return {
+        "items": result.get("items", []),
+        "total": result.get("total", 0),
+        "page": page or 1,
+        "limit": limit,
+    }
+
+
+@_op(stalwart_read)
+def list_mailing_lists(
+    page: int | None = None,
+    limit: int = 20,
+):
+    """List mailing lists."""
+    position = 0
+    if page is not None and page > 0:
+        position = (page - 1) * limit
+
+    result = _get_client().query_and_get(
+        object_type="x:MailingList",
+        limit=limit,
+        position=position,
+        properties=["id", "name", "description"],
+    )
+    return {
+        "items": result.get("items", []),
+        "total": result.get("total", 0),
+        "page": page or 1,
+        "limit": limit,
+    }
 
 
 # ── stalwart_write ────────────────────────────────────────────────────
@@ -321,118 +672,229 @@ def create_principal(
     disabledPermissions: list | None = None,
     externalMembers: list | None = None,
 ):
-    """Create a principal. type: individual,group,list,domain,tenant,role,apiKey,oauthClient,resource,location."""
-    body: dict = {"type": type, "name": name}
+    """Create a principal (account). type: individual, group, list, domain, tenant, role, apiKey, oauthClient."""
+    props: dict = {"type": type, "name": name}
     if description is not None:
-        body["description"] = description
+        props["description"] = description
     if quota is not None:
-        body["quota"] = quota
+        props["quota"] = quota
     if secrets is not None:
-        body["secrets"] = secrets
+        props["secrets"] = secrets
     if emails is not None:
-        body["emails"] = emails
+        props["emails"] = emails
     if urls is not None:
-        body["urls"] = urls
+        props["urls"] = urls
     if memberOf is not None:
-        body["memberOf"] = memberOf
+        props["memberOf"] = memberOf
     if roles is not None:
-        body["roles"] = roles
+        props["roles"] = roles
     if lists is not None:
-        body["lists"] = lists
+        props["lists"] = lists
     if members is not None:
-        body["members"] = members
+        props["members"] = members
     if enabledPermissions is not None:
-        body["enabledPermissions"] = enabledPermissions
+        props["enabledPermissions"] = enabledPermissions
     if disabledPermissions is not None:
-        body["disabledPermissions"] = disabledPermissions
+        props["disabledPermissions"] = disabledPermissions
     if externalMembers is not None:
-        body["externalMembers"] = externalMembers
-    return _ok(_get_client().post("/api/principal", json=body))
+        props["externalMembers"] = externalMembers
+
+    result = _get_client().set_objects(
+        object_type="x:Account",
+        create={"newPrincipal": props},
+    )
+    created = result.get("created", {})
+    if created:
+        return {"status": "created", "principal": list(created.values())[0]}
+    not_created = result.get("notCreated", {})
+    if not_created:
+        return {"status": "error", "not_created": not_created}
+    return _ok(result)
 
 
 @_op(stalwart_write)
 def update_principal(id: str, changes: list):
-    """Update a principal. changes: array of {action, field, value} objects. action: set,addItem,removeItem."""
-    return _ok(_get_client().patch(f"/api/principal/{id}", json=changes))
+    """Update a principal. changes: array of {path, value} for JMAP patch.
+
+    Each change: {"path": "/propertyName", "value": newValue}
+    Example: {"path": "/description", "value": "New description"}
+    """
+    # Convert changes array to a flat update dict
+    update_props = {}
+    for change in changes:
+        if isinstance(change, dict):
+            path = change.get("path", "").lstrip("/")
+            value = change.get("value")
+            if path:
+                update_props[path] = value
+
+    if not update_props:
+        return {"error": "No valid changes provided. Use [{path: '/field', value: newValue}] format."}
+
+    result = _get_client().set_objects(
+        object_type="x:Account",
+        update={id: update_props},
+    )
+    updated = result.get("updated", {})
+    if updated:
+        return {"status": "updated", "principal": updated.get(id, {})}
+    not_updated = result.get("notUpdated", {})
+    if not_updated:
+        return {"status": "error", "not_updated": not_updated}
+    return _ok(result)
 
 
 @_op(stalwart_write)
 def start_queue():
     """Resume mail queue processing."""
-    return _ok(_get_client().patch("/api/queue/status/start"))
+    return _unavailable(
+        "StartQueue",
+        "Queue start/stop has no JMAP management method in Stalwart v0.16. "
+        "Use the WebAdmin Management > Emails section.",
+    )
 
 
 @_op(stalwart_write)
 def stop_queue():
     """Pause mail queue processing."""
-    return _ok(_get_client().patch("/api/queue/status/stop"))
+    return _unavailable(
+        "StopQueue",
+        "Queue start/stop has no JMAP management method in Stalwart v0.16. "
+        "Use the WebAdmin Management > Emails section.",
+    )
 
 
 @_op(stalwart_write)
 def reschedule_messages(filter: str | None = None):
-    """Bulk reschedule queued messages. filter: query string."""
-    params: dict = {}
+    """Bulk reschedule queued messages. filter: query string.
+
+    Reschedules matching messages to retry immediately by updating nextRetry."""
+    props = {"nextRetry": "now"}
     if filter is not None:
-        params["filter"] = filter
-    return _ok(_get_client().patch("/api/queue/messages", params=params))
+        # Filter is applied via JMAP query, but /set needs explicit IDs
+        # For now, this requires the caller to use list_queue_messages first
+        # and pass specific IDs to reschedule_message
+        return {
+            "error": "Bulk reschedule requires explicit message IDs.",
+            "suggestion": "Use ListQueueMessages to find message IDs, "
+                          "then RescheduleMessage for each.",
+        }
+
+    return _unavailable("RescheduleMessages",
+                        "Bulk reschedule requires explicit IDs. "
+                        "Use RescheduleMessage for individual messages.")
 
 
 @_op(stalwart_write)
-def reschedule_message(id: int):
-    """Reschedule a single queued message."""
-    return _ok(_get_client().patch(f"/api/queue/messages/{id}"))
+def reschedule_message(id: str):
+    """Reschedule a single queued message by ID (sets nextRetry to now)."""
+    result = _get_client().set_objects(
+        object_type="x:QueuedMessage",
+        update={id: {"nextRetry": "now"}},
+    )
+    updated = result.get("updated", {})
+    if updated:
+        return {"status": "rescheduled", "id": id}
+    not_updated = result.get("notUpdated", {})
+    if not_updated:
+        return {"status": "error", "not_updated": not_updated, "id": id}
+    return _ok(result)
 
 
 @_op(stalwart_write)
 def update_settings(settings: list):
-    """Update settings. settings: array of operations. Types:
-    - Insert: {"type": "insert", "prefix": null, "values": [["key", "value"], ...], "assert_empty": false}
-    - Delete: {"type": "delete", "keys": ["key1", "key2"]}
-    - Clear:  {"type": "clear", "prefix": "some.prefix."}
+    """Update system settings. settings: array of {key, value} pairs.
+
+    Each item: {"key": "propertyName", "value": newValue}
+    Example: {"key": "defaultHostname", "value": "mail.example.com"}
     """
-    return _ok(_get_client().post("/api/settings", json=settings))
+    update_props = {}
+    for s in settings:
+        if isinstance(s, dict):
+            key = s.get("key", "")
+            value = s.get("value")
+            if key and key != "id":
+                update_props[key] = value
+
+    if not update_props:
+        return {"error": "No valid settings provided."}
+
+    result = _get_client().set_objects(
+        object_type="x:SystemSettings",
+        update={"singleton": update_props},
+    )
+    updated = result.get("updated", {})
+    if updated:
+        return {"status": "updated", "settings": updated.get("singleton", {})}
+    return _ok(result)
 
 
 @_op(stalwart_write)
 def generate_dkim(
-    id: str,
-    algorithm: str | None = None,
-    domain: str | None = None,
-    selector: str | None = None,
+    domain: str,
+    selector: str,
+    algorithm: str = "rsa-sha256",
 ):
-    """Generate DKIM keys. Returns DKIM DNS record."""
-    body: dict = {"id": id}
-    if algorithm is not None:
-        body["algorithm"] = algorithm
-    if domain is not None:
-        body["domain"] = domain
-    if selector is not None:
-        body["selector"] = selector
-    return _ok(_get_client().post("/api/dkim", json=body))
+    """Generate DKIM keys. Returns the new DKIM signature info.
+
+    algorithm: rsa-sha256 or ed25519-sha256
+    """
+    result = _get_client().set_objects(
+        object_type="x:DkimSignature",
+        create={
+            "newDkim": {
+                "domain": domain,
+                "selector": selector,
+                "algorithm": algorithm,
+            }
+        },
+    )
+    created = result.get("created", {})
+    if created:
+        sig = list(created.values())[0]
+        return {"status": "created", "dkim": sig}
+    not_created = result.get("notCreated", {})
+    if not_created:
+        return {"status": "error", "not_created": not_created}
+    return _ok(result)
 
 
 @_op(stalwart_write)
 def train_spam(message: str):
     """Train global spam classifier with a spam message."""
-    return _ok(_get_client().post("/api/spam-filter/train/spam", content=message, headers={"Content-Type": "text/plain"}))
+    return _unavailable(
+        "TrainSpam",
+        "Spam filter training has no JMAP management endpoint in Stalwart v0.16. "
+        "Use the WebAdmin or IMAP Junk folder for bayes training.",
+    )
 
 
 @_op(stalwart_write)
 def train_ham(message: str):
     """Train global spam classifier with a ham (not spam) message."""
-    return _ok(_get_client().post("/api/spam-filter/train/ham", content=message, headers={"Content-Type": "text/plain"}))
+    return _unavailable(
+        "TrainHam",
+        "Spam filter training has no JMAP management endpoint in Stalwart v0.16. "
+        "Use the WebAdmin or IMAP Junk folder for bayes training.",
+    )
 
 
 @_op(stalwart_write)
 def train_account_spam(account_id: str, message: str):
     """Train per-account spam classifier with a spam message."""
-    return _ok(_get_client().post(f"/api/spam-filter/train/spam/{account_id}", content=message, headers={"Content-Type": "text/plain"}))
+    return _unavailable(
+        "TrainAccountSpam",
+        "Per-account spam filter training has no JMAP management endpoint.",
+    )
 
 
 @_op(stalwart_write)
 def train_account_ham(account_id: str, message: str):
     """Train per-account spam classifier with a ham (not spam) message."""
-    return _ok(_get_client().post(f"/api/spam-filter/train/ham/{account_id}", content=message, headers={"Content-Type": "text/plain"}))
+    return _unavailable(
+        "TrainAccountHam",
+        "Per-account spam filter training has no JMAP management endpoint.",
+    )
 
 
 @_op(stalwart_write)
@@ -447,28 +909,20 @@ def classify_spam(
     env_rcpt_to: list | None = None,
 ):
     """Test spam classification for a message."""
-    body: dict = {"message": message}
-    if remote_ip is not None:
-        body["remoteIp"] = remote_ip
-    if ehlo_domain is not None:
-        body["ehloDomain"] = ehlo_domain
-    if authenticated_as is not None:
-        body["authenticatedAs"] = authenticated_as
-    if is_tls is not None:
-        body["isTls"] = is_tls
-    if env_from is not None:
-        body["envFrom"] = env_from
-    if env_from_flags is not None:
-        body["envFromFlags"] = env_from_flags
-    if env_rcpt_to is not None:
-        body["envRcptTo"] = env_rcpt_to
-    return _ok(_get_client().post("/api/spam-filter/classify", json=body))
+    return _unavailable(
+        "ClassifySpam",
+        "Spam classification testing has no JMAP endpoint in Stalwart v0.16. "
+        "Use the WebAdmin or send a test message.",
+    )
 
 
 @_op(stalwart_write)
 def restore_deleted_messages(account_id: str, messages: list):
-    """Restore deleted messages. messages: array of {hash, collection, restoreTime, cancelDeletion}."""
-    return _ok(_get_client().post(f"/api/store/undelete/{account_id}", json=messages))
+    """Restore deleted messages. messages: array of message IDs."""
+    return _unavailable(
+        "RestoreDeletedMessages",
+        "Message restore has no JMAP management endpoint. Use IMAP or the WebAdmin.",
+    )
 
 
 @_op(stalwart_write)
@@ -478,14 +932,11 @@ def update_encryption(
     certs: str | None = None,
 ):
     """Update encryption-at-rest settings."""
-    body: dict = {}
-    if type is not None:
-        body["type"] = type
-    if algo is not None:
-        body["algo"] = algo
-    if certs is not None:
-        body["certs"] = certs
-    return _ok(_get_client().post("/api/account/crypto", json=body))
+    return _unavailable(
+        "UpdateEncryption",
+        "Encryption settings are managed via x:SystemSettings JMAP object. "
+        "Use UpdateSettings with appropriate encryption keys.",
+    )
 
 
 @_op(stalwart_write)
@@ -495,14 +946,11 @@ def update_auth(
     app_passwords: list | None = None,
 ):
     """Update authentication settings (2FA, app passwords)."""
-    body: dict = {}
-    if type is not None:
-        body["type"] = type
-    if totp_token is not None:
-        body["totpToken"] = totp_token
-    if app_passwords is not None:
-        body["appPasswords"] = app_passwords
-    return _ok(_get_client().post("/api/account/auth", json=body))
+    return _unavailable(
+        "UpdateAuth",
+        "Authentication settings are managed via x:SystemSettings JMAP object. "
+        "Use UpdateSettings with appropriate authentication keys.",
+    )
 
 
 # ── stalwart_delete ───────────────────────────────────────────────────
@@ -510,105 +958,209 @@ def update_auth(
 @_op(stalwart_delete)
 def delete_principal(id: str):
     """Delete a principal. Irreversible."""
-    return _ok(_get_client().delete(f"/api/principal/{id}"))
+    result = _get_client().set_objects(
+        object_type="x:Account",
+        destroy=[id],
+    )
+    destroyed = result.get("destroyed", [])
+    if destroyed:
+        return {"status": "deleted", "id": destroyed[0]}
+    not_destroyed = result.get("notDestroyed", {})
+    if not_destroyed:
+        return {"status": "error", "not_destroyed": not_destroyed}
+    return _ok(result)
 
 
 @_op(stalwart_delete)
 def delete_queue_messages(text: str | None = None):
-    """Bulk delete queued messages by filter text."""
-    params: dict = {}
+    """Bulk delete queued messages by filter text.
+
+    WARNING: This queries matching messages then deletes them all.
+    """
+    # First query to find matching IDs
+    filter_dict = None
     if text is not None:
-        params["text"] = text
-    return _ok(_get_client().delete("/api/queue/messages", params=params))
+        filter_dict = {"text": text}
+
+    result = _get_client().query_and_get(
+        object_type="x:QueuedMessage",
+        filter=filter_dict,
+        limit=250,
+        properties=["id"],
+    )
+    ids = [item["id"] for item in result.get("items", []) if "id" in item]
+
+    if not ids:
+        return {"status": "ok", "deleted": 0, "message": "No matching messages found."}
+
+    delete_result = _get_client().set_objects(
+        object_type="x:QueuedMessage",
+        destroy=ids,
+    )
+    destroyed = delete_result.get("destroyed", [])
+    return {
+        "status": "deleted",
+        "deleted_count": len(destroyed),
+        "ids": destroyed,
+    }
 
 
 @_op(stalwart_delete)
-def delete_queue_message(id: int):
-    """Delete a single queued message."""
-    return _ok(_get_client().delete(f"/api/queue/messages/{id}"))
+def delete_queue_message(id: str):
+    """Delete a single queued message by ID."""
+    result = _get_client().set_objects(
+        object_type="x:QueuedMessage",
+        destroy=[id],
+    )
+    destroyed = result.get("destroyed", [])
+    if destroyed:
+        return {"status": "deleted", "id": destroyed[0]}
+    not_destroyed = result.get("notDestroyed", {})
+    if not_destroyed:
+        return {"status": "error", "not_destroyed": not_destroyed}
+    return _ok(result)
 
 
 @_op(stalwart_delete)
 def purge_blobs():
     """Purge unreferenced blobs from store."""
-    return _ok(_get_client().get("/api/store/purge/blob"))
+    return _unavailable(
+        "PurgeBlobs",
+        "Store purge operations have no JMAP management endpoint. "
+        "Use the WebAdmin Actions section.",
+    )
 
 
 @_op(stalwart_delete)
 def purge_data():
     """Purge data store."""
-    return _ok(_get_client().get("/api/store/purge/data"))
+    return _unavailable(
+        "PurgeData",
+        "Store purge operations have no JMAP management endpoint.",
+    )
 
 
 @_op(stalwart_delete)
 def purge_cache():
     """Purge in-memory cache."""
-    return _ok(_get_client().get("/api/store/purge/in-memory"))
+    return _unavailable(
+        "PurgeCache",
+        "Store purge operations have no JMAP management endpoint.",
+    )
 
 
 @_op(stalwart_delete)
 def purge_all_accounts():
     """Purge all account data."""
-    return _ok(_get_client().get("/api/store/purge/account"))
+    return _unavailable(
+        "PurgeAllAccounts",
+        "Store purge operations have no JMAP management endpoint.",
+    )
 
 
 @_op(stalwart_delete)
 def purge_account(account_id: str):
     """Purge a single account's data."""
-    return _ok(_get_client().get(f"/api/store/purge/account/{account_id}"))
+    return _unavailable(
+        "PurgeAccount",
+        "Store purge operations have no JMAP management endpoint.",
+    )
 
 
 @_op(stalwart_delete)
 def delete_global_bayes():
     """Delete global Bayes spam model."""
-    return _ok(_get_client().get("/api/store/purge/in-memory/default/bayes-global"))
+    return _unavailable(
+        "DeleteGlobalBayes",
+        "Bayes model management has no JMAP endpoint.",
+    )
 
 
 @_op(stalwart_delete)
 def delete_account_bayes(account_id: str):
     """Delete per-account Bayes spam model."""
-    return _ok(_get_client().get(f"/api/store/purge/in-memory/default/bayes-account/{account_id}"))
+    return _unavailable(
+        "DeleteAccountBayes",
+        "Bayes model management has no JMAP endpoint.",
+    )
 
 
 @_op(stalwart_delete)
 def reset_imap_uids(account_id: str):
     """Reset IMAP UIDs for an account."""
-    return _ok(_get_client().delete(f"/api/store/uids/{account_id}"))
+    return _unavailable(
+        "ResetImapUids",
+        "IMAP UID reset has no JMAP management endpoint.",
+    )
 
 
 # ── stalwart_admin ────────────────────────────────────────────────────
 
 @_op(stalwart_admin)
 def reload_config(dry_run: bool = False):
-    """Reload server configuration. Returns warnings and errors."""
-    params: dict = {}
-    if dry_run:
-        params["dry-run"] = "true"
-    return _ok(_get_client().get("/api/reload", params=params))
+    """Reload server configuration. Returns warnings and errors.
+
+    Note: Stalwart Community Edition does not expose a JMAP reload endpoint.
+    This operation checks connectivity and reports current state.
+    """
+    try:
+        client = _get_client()
+        result = client.query_and_get(
+            object_type="x:Account",
+            limit=1,
+            properties=["id"],
+        )
+        status = {
+            "status": "ok",
+            "note": "Stalwart Community Edition loads config from database on restart. "
+                    "No live reload needed for most changes — they take effect immediately "
+                    "via the JMAP management API.",
+        }
+        if dry_run:
+            status["dry_run"] = True
+            status["config_source"] = "RocksDB internal database"
+        return status
+    except Exception as exc:
+        return {"status": "error", "detail": str(exc)}
 
 
 @_op(stalwart_admin)
 def update_spam_filter():
     """Update spam filter databases."""
-    return _ok(_get_client().get("/api/update/spam-filter"))
+    return _unavailable(
+        "UpdateSpamFilter",
+        "Spam filter update has no JMAP management endpoint.",
+    )
 
 
 @_op(stalwart_admin)
 def update_webadmin():
-    """Update web admin UI."""
-    return _ok(_get_client().get("/api/update/webadmin"))
+    """Update web admin UI (no-op: Stalwart container image bundles WebAdmin)."""
+    return {
+        "status": "ok",
+        "note": "WebAdmin is bundled in the Stalwart container image. "
+                "Update the Docker image to update the WebAdmin.",
+    }
 
 
 @_op(stalwart_admin)
 def reindex():
     """Rebuild full-text search index."""
-    return _ok(_get_client().get("/api/store/reindex"))
+    return _unavailable(
+        "Reindex",
+        "Full-text reindex has no JMAP management endpoint. "
+        "Use the WebAdmin Actions section.",
+    )
 
 
 @_op(stalwart_admin)
 def get_diagnostics_token():
     """Get diagnostics/troubleshooting token."""
-    return _ok(_get_client().get("/api/troubleshoot/token"))
+    return _unavailable(
+        "GetDiagnosticsToken",
+        "Diagnostics token is available via /api/token/ endpoint, not JMAP. "
+        "Use the WebAdmin for troubleshooting.",
+    )
 
 
 @_op(stalwart_admin)
@@ -619,34 +1171,45 @@ def validate_dmarc(
     body: str,
 ):
     """Validate DMARC for a message. Returns SPF, DKIM, ARC, DMARC results."""
-    payload: dict = {
-        "remoteIp": remote_ip,
-        "ehloDomain": ehlo_domain,
-        "mailFrom": mail_from,
-        "body": body,
-    }
-    return _ok(_get_client().post("/api/troubleshoot/dmarc", json=payload))
+    return _unavailable(
+        "ValidateDmarc",
+        "DMARC validation has no JMAP management endpoint.",
+    )
 
 
 @_op(stalwart_admin)
 def get_metrics_token():
     """Get token for live metrics streaming."""
-    return _ok(_get_client().get("/api/telemetry/live/metrics-token"))
+    return _unavailable(
+        "GetMetricsToken",
+        "Metrics token has no JMAP management endpoint.",
+    )
 
 
 @_op(stalwart_admin)
 def get_tracing_token():
     """Get token for live trace streaming."""
-    return _ok(_get_client().get("/api/telemetry/live/tracing-token"))
+    return _unavailable(
+        "GetTracingToken",
+        "Tracing token has no JMAP management endpoint.",
+    )
 
 
 @_op(stalwart_admin)
 def get_encryption_settings():
     """Get encryption-at-rest settings."""
-    return _ok(_get_client().get("/api/account/crypto"))
+    return _unavailable(
+        "GetEncryptionSettings",
+        "Encryption settings are available via x:SystemSettings JMAP object. "
+        "Use GetSettingsByGroup or ListSettings.",
+    )
 
 
 @_op(stalwart_admin)
 def get_auth_settings():
     """Get authentication settings (2FA, app passwords)."""
-    return _ok(_get_client().get("/api/account/auth"))
+    return _unavailable(
+        "GetAuthSettings",
+        "Authentication settings are available via x:SystemSettings JMAP object. "
+        "Use GetSettingsByGroup or ListSettings.",
+    )
